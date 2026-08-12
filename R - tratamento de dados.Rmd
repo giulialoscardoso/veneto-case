@@ -1,0 +1,443 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-08-10"
+---
+
+```{r transformacao-completa}
+
+# ============================================================
+# PIPELINE COMPLETO
+# EXTRAÇÃO + TRANSFORMAÇÃO + VALIDAÇÃO + EXPORTAÇÃO
+# ============================================================
+
+
+# ============================================================
+# 0. PACOTES
+# ============================================================
+
+pacotes <- c(
+  "rbcb",
+  "dplyr",
+  "lubridate",
+  "reticulate"
+)
+
+novos <- pacotes[!(pacotes %in% installed.packages()[, "Package"])]
+
+if (length(novos) > 0) {
+  install.packages(novos)
+}
+
+library(rbcb)
+library(dplyr)
+library(lubridate)
+library(reticulate)
+
+
+# ============================================================
+# 1. DEFINIR PERÍODO
+# ============================================================
+
+data_final <- Sys.Date()
+data_inicial <- data_final %m-% years(5)
+
+
+# ============================================================
+# 2. EXTRAÇÃO - BANCO CENTRAL / SGS
+# ============================================================
+
+# CDI - SGS 4389
+cdi <- rbcb::get_series(
+  c(CDI = 4389)
+) %>%
+  filter(
+    date >= data_inicial,
+    date <= data_final
+  ) %>%
+  rename(
+    data = date,
+    valor = CDI
+  )
+
+
+# IPCA - SGS 433
+ipca <- rbcb::get_series(
+  c(IPCA = 433)
+) %>%
+  filter(
+    date >= data_inicial,
+    date <= data_final
+  ) %>%
+  rename(
+    data = date,
+    valor = IPCA
+  )
+
+
+# Dólar venda - SGS 1
+dolar <- rbcb::get_series(
+  c(Dolar = 1)
+) %>%
+  filter(
+    date >= data_inicial,
+    date <= data_final
+  ) %>%
+  rename(
+    data = date,
+    valor = Dolar
+  )
+
+
+# ============================================================
+# 3. EXTRAÇÃO - IBOVESPA VIA YFINANCE
+# ============================================================
+
+# Instala yfinance no Python caso ainda não exista
+if (!py_module_available("yfinance")) {
+  py_install("yfinance")
+}
+
+# Importa yfinance sem converter imediatamente para R
+yf <- import(
+  "yfinance",
+  convert = FALSE
+)
+
+# O parâmetro end do yfinance é exclusivo,
+# então usamos o dia seguinte para incluir a última data.
+ibov_py <- yf$download(
+  tickers = "^BVSP",
+  start = as.character(data_inicial),
+  end = as.character(data_final + days(1)),
+  auto_adjust = FALSE,
+  progress = FALSE,
+  multi_level_index = FALSE
+)
+
+# Coloca a data, que vem como índice, em uma coluna
+ibov_py <- ibov_py$reset_index()
+
+# Converte o DataFrame Python para R
+ibov <- py_to_r(ibov_py)
+
+
+# ============================================================
+# 4. TRATAMENTO DO CDI
+# ============================================================
+
+cdi_tratado <- cdi %>%
+  mutate(
+    data = as.Date(data),
+    valor = as.numeric(valor)
+  ) %>%
+  filter(
+    !is.na(data),
+    !is.na(valor)
+  ) %>%
+  distinct(
+    data,
+    .keep_all = TRUE
+  ) %>%
+  arrange(data) %>%
+  mutate(
+    # Taxa diária equivalente a partir
+    # do CDI anualizado em base 252
+    cdi_diario =
+      (1 + valor / 100)^(1 / 252) - 1
+  )
+
+
+cdi_mensal <- cdi_tratado %>%
+  mutate(
+    mes = floor_date(data, "month")
+  ) %>%
+  group_by(mes) %>%
+  summarise(
+    # Trajetória do patamar de juros
+    cdi_medio_aa = mean(valor),
+
+    # Retorno efetivo acumulado no mês
+    cdi_acumulado_mes =
+      (prod(1 + cdi_diario) - 1) * 100,
+
+    .groups = "drop"
+  )
+
+
+# ============================================================
+# 5. TRATAMENTO DO IPCA
+# ============================================================
+
+ipca_tratado <- ipca %>%
+  mutate(
+    data = as.Date(data),
+    valor = as.numeric(valor)
+  ) %>%
+  filter(
+    !is.na(data),
+    !is.na(valor)
+  ) %>%
+  distinct(
+    data,
+    .keep_all = TRUE
+  ) %>%
+  arrange(data) %>%
+  mutate(
+    # Variação mensal transformada em fator
+    fator_ipca =
+      1 + valor / 100,
+
+    # Evolução acumulada do nível de preços
+    indice_precos =
+      100 * cumprod(fator_ipca),
+
+    # Inflação acumulada em 12 meses
+    ipca_12m =
+      (
+        indice_precos /
+        lag(indice_precos, 12)
+        - 1
+      ) * 100
+  )
+
+
+ipca_mensal <- ipca_tratado %>%
+  transmute(
+    mes = floor_date(data, "month"),
+    ipca_mes = valor,
+    ipca_12m,
+    indice_precos
+  )
+
+
+# ============================================================
+# 6. TRATAMENTO DO DÓLAR
+# ============================================================
+
+dolar_tratado <- dolar %>%
+  mutate(
+    data = as.Date(data),
+    valor = as.numeric(valor)
+  ) %>%
+  filter(
+    !is.na(data),
+    !is.na(valor)
+  ) %>%
+  distinct(
+    data,
+    .keep_all = TRUE
+  ) %>%
+  arrange(data)
+
+
+dolar_mensal <- dolar_tratado %>%
+  mutate(
+    mes = floor_date(data, "month")
+  ) %>%
+  group_by(mes) %>%
+  summarise(
+    # Média somente dos dias com observação
+    dolar_medio = mean(valor),
+
+    # Última cotação disponível do mês
+    dolar_fechamento = last(valor),
+
+    .groups = "drop"
+  ) %>%
+  arrange(mes) %>%
+  mutate(
+    # Variação entre o fechamento deste mês
+    # e o fechamento do mês anterior
+    dolar_variacao_mes =
+      (
+        dolar_fechamento /
+        lag(dolar_fechamento)
+        - 1
+      ) * 100
+  )
+
+
+# ============================================================
+# 7. TRATAMENTO DO IBOVESPA
+# ============================================================
+
+# Padronizar nome da coluna de data
+if ("Date" %in% names(ibov)) {
+
+  ibov <- ibov %>%
+    rename(
+      data = Date
+    )
+
+} else if ("Datetime" %in% names(ibov)) {
+
+  ibov <- ibov %>%
+    rename(
+      data = Datetime
+    )
+}
+
+
+# Padronizar fechamento
+ibov_tratado <- ibov %>%
+  transmute(
+    data = as.Date(data),
+    close = as.numeric(Close)
+  ) %>%
+  filter(
+    !is.na(data),
+    !is.na(close)
+  ) %>%
+  distinct(
+    data,
+    .keep_all = TRUE
+  ) %>%
+  arrange(data)
+
+
+ibov_mensal <- ibov_tratado %>%
+  mutate(
+    mes = floor_date(data, "month")
+  ) %>%
+  group_by(mes) %>%
+  summarise(
+    # Patamar médio mensal
+    ibov_medio = mean(close),
+
+    # Fechamento do último pregão do mês
+    ibov_fechamento = last(close),
+
+    .groups = "drop"
+  ) %>%
+  arrange(mes) %>%
+  mutate(
+    # Retorno mensal
+    ibov_retorno_mes =
+      (
+        ibov_fechamento /
+        lag(ibov_fechamento)
+        - 1
+      ) * 100
+  )
+
+
+# ============================================================
+# 8. JUNTAR AS QUATRO BASES MENSAIS
+# ============================================================
+
+base_mensal <- cdi_mensal %>%
+  full_join(
+    ipca_mensal,
+    by = "mes"
+  ) %>%
+  full_join(
+    dolar_mensal,
+    by = "mes"
+  ) %>%
+  full_join(
+    ibov_mensal,
+    by = "mes"
+  ) %>%
+  arrange(mes)
+
+
+# ============================================================
+# 9. ÚLTIMOS VALORES PARA OS CARDS
+# ============================================================
+
+ultimo_cdi <- cdi_tratado %>%
+  slice_tail(n = 1)
+
+ultimo_ipca <- ipca_tratado %>%
+  slice_tail(n = 1)
+
+ultimo_dolar <- dolar_tratado %>%
+  slice_tail(n = 1)
+
+ultimo_ibov <- ibov_tratado %>%
+  slice_tail(n = 1)
+
+
+dados_atuais <- data.frame(
+
+  indicador = c(
+    "CDI",
+    "IPCA 12 meses",
+    "Dólar",
+    "Ibovespa"
+  ),
+
+  data = as.Date(c(
+    ultimo_cdi$data,
+    ultimo_ipca$data,
+    ultimo_dolar$data,
+    ultimo_ibov$data
+  )),
+
+  valor = c(
+    ultimo_cdi$valor,
+    ultimo_ipca$ipca_12m,
+    ultimo_dolar$valor,
+    ultimo_ibov$close
+  ),
+
+  unidade = c(
+    "% a.a.",
+    "%",
+    "R$/US$",
+    "pontos"
+  )
+)
+
+
+# ============================================================
+# 10. VALIDAÇÕES
+# ============================================================
+
+cat("\nPERÍODO DA BASE:\n")
+print(range(base_mensal$mes))
+
+cat("\nQUANTIDADE DE MESES:\n")
+print(nrow(base_mensal))
+
+cat("\nVALORES AUSENTES:\n")
+print(colSums(is.na(base_mensal)))
+
+cat("\nMESES DUPLICADOS:\n")
+print(sum(duplicated(base_mensal$mes)))
+
+cat("\nÚLTIMOS INDICADORES:\n")
+print(dados_atuais)
+
+
+# Abrir a base no visualizador do RStudio
+View(base_mensal)
+
+
+# ============================================================
+# 11. EXPORTAÇÃO PARA O POWER BI
+# ============================================================
+
+dir.create(
+  "data/processed",
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+write.csv(
+  base_mensal,
+  "data/processed/indicadores_mensais.csv",
+  row.names = FALSE
+)
+
+
+write.csv(
+  dados_atuais,
+  "data/processed/indicadores_atuais.csv",
+  row.names = FALSE
+)
+                                                                                                                   
+
+
